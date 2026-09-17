@@ -6,9 +6,14 @@ cmake_minimum_required(VERSION 3.16)
 
 set(PROJECT_VER "2.0.4")
 
+# Portable defaults captured from the working four-servo Otto firmware.
+set(IDF_TARGET "esp32s3" CACHE STRING "Otto target")
+if(NOT DEFINED SDKCONFIG_DEFAULTS)
+    set(SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults.otto")
+endif()
+
 # Add this line to disable the specific warning
 add_compile_options(-Wno-missing-field-initializers)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(xiaozhi)
-

@@ -1,3 +1,7 @@
+# 本仓库：四舵机 Otto 固件源码
+
+克隆后在 **ESP-IDF v5.5.5** 环境中运行 `idf.py build`，无需复制旧电脑的 build 或 server。完整步骤见 [编译与烧录说明](BUILD_OTTO.md)。以下为上游项目介绍。
+
 # An MCP-based Chatbot
 
 （中文 | [English](README_en.md) | [日本語](README_ja.md)）

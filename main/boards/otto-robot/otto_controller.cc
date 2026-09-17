@@ -6,8 +6,11 @@
 #include <esp_log.h>
 
 #include <cstring>
+#include <atomic>
+#include <string_view>
 
 #include "application.h"
+#include "assets/lang_config.h"
 #include "board.h"
 #include "config.h"
 #include "mcp_server.h"
@@ -24,6 +27,31 @@ private:
     QueueHandle_t action_queue_;
     bool has_hands_ = false;
     bool is_action_in_progress_ = false;
+    QueueHandle_t sound_queue_ = nullptr;
+    std::atomic<bool> sound_busy_{false};
+
+    static void SoundTask(void* arg) {
+        auto* controller = static_cast<OttoController*>(arg);
+        std::string_view sound;
+        while (true) {
+            if (xQueueReceive(controller->sound_queue_, &sound, portMAX_DELAY) == pdTRUE) {
+                Application::GetInstance().PlaySound(sound);
+                controller->sound_busy_.store(false);
+            }
+        }
+    }
+
+    // All callers pass embedded assets, whose data remains valid for this task.
+    bool QueueSound(std::string_view sound) {
+        if (sound_queue_ == nullptr || sound.empty() || sound_busy_.exchange(true)) {
+            return false;
+        }
+        if (xQueueSend(sound_queue_, &sound, 0) != pdTRUE) {
+            sound_busy_.store(false);
+            return false;
+        }
+        return true;
+    }
 
     struct OttoActionParams {
         int action_type;
@@ -53,6 +81,35 @@ private:
         ACTION_HOME = 17
     };
 
+    std::string_view GetActionSound(int action_type) const {
+        switch (action_type) {
+            case ACTION_WALK:
+                return Lang::Sounds::OGG_ACTION_WALK;
+            case ACTION_SWING:
+                return Lang::Sounds::OGG_ACTION_SWING;
+            case ACTION_TURN:
+            case ACTION_JUMP:
+                return Lang::Sounds::OGG_ACTION_TURN_JUMP;
+            case ACTION_BEND:
+            case ACTION_SHAKE_LEG:
+                return Lang::Sounds::OGG_ACTION_BEND_SHAKE_LEG;
+            case ACTION_MOONWALK:
+            case ACTION_UPDOWN:
+            case ACTION_TIPTOE_SWING:
+            case ACTION_JITTER:
+            case ACTION_ASCENDING_TURN:
+            case ACTION_CRUSAITO:
+            case ACTION_FLAPPING:
+            case ACTION_HANDS_UP:
+            case ACTION_HANDS_DOWN:
+            case ACTION_HAND_WAVE:
+                return Lang::Sounds::OGG_ACTION_OTHER;
+            case ACTION_HOME:
+            default:
+                return {};
+        }
+    }
+
     static void ActionTask(void* arg) {
         OttoController* controller = static_cast<OttoController*>(arg);
         OttoActionParams params;
@@ -62,6 +119,12 @@ private:
             if (xQueueReceive(controller->action_queue_, &params, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 ESP_LOGI(TAG, "执行动作: %d", params.action_type);
                 controller->is_action_in_progress_ = true;
+
+                // Enqueue without waiting for audio decoding so motion starts immediately.
+                auto action_sound = controller->GetActionSound(params.action_type);
+                if (!action_sound.empty()) {
+                    controller->QueueSound(action_sound);
+                }
 
                 switch (params.action_type) {
                     case ACTION_WALK:
@@ -185,6 +248,15 @@ public:
         LoadTrimsFromNVS();
 
         action_queue_ = xQueueCreate(10, sizeof(OttoActionParams));
+        sound_queue_ = xQueueCreate(1, sizeof(std::string_view));
+        if (sound_queue_ != nullptr &&
+            xTaskCreate(SoundTask, "otto_sound", 4096, this, 3, nullptr) != pdPASS) {
+            vQueueDelete(sound_queue_);
+            sound_queue_ = nullptr;
+        }
+        if (sound_queue_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create sound playback task");
+        }
 
         QueueAction(ACTION_HOME, 1, 1000, 1, 0);  // direction=1表示复位手部
 
@@ -195,6 +267,16 @@ public:
         auto& mcp_server = McpServer::GetInstance();
 
         ESP_LOGI(TAG, "开始注册MCP工具...");
+
+        mcp_server.AddTool("self.otto.laugh",
+                          "播放一次本地奶龙大笑音频，不移动舵机。听不懂用户的话，或用户要求奶龙大笑时调用。"
+                          "成功仅表示开始安排播放，不要再朗读笑声或声称已播放完毕。",
+                          PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                              if (!QueueSound(Lang::Sounds::OGG_ACTION_SWING)) {
+                                  return std::string("音效忙或暂不可用，本次未安排播放");
+                              }
+                              return std::string("已安排播放奶龙大笑，无需额外语音回复");
+                          });
 
         // 基础移动动作
         mcp_server.AddTool("self.otto.walk_forward",
