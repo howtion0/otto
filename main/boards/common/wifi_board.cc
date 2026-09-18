@@ -142,9 +142,13 @@ const char* WifiBoard::GetNetworkStateIcon() {
 std::string WifiBoard::GetBoardJson() {
     // Set the board type for OTA
     auto& wifi_station = WifiStation::GetInstance();
+    Settings identity("otto", false);
+    const std::string configured_name = identity.GetString("name");
+    const std::string device_name =
+        configured_name.empty() ? std::string(BOARD_NAME) : configured_name;
     std::string board_json = R"({)";
     board_json += R"("type":")" + std::string(BOARD_TYPE) + R"(",)";
-    board_json += R"("name":")" + std::string(BOARD_NAME) + R"(",)";
+    board_json += R"("name":")" + device_name + R"(",)";
     if (!wifi_config_mode_) {
         board_json += R"("ssid":")" + wifi_station.GetSsid() + R"(",)";
         board_json += R"("rssi":)" + std::to_string(wifi_station.GetRssi()) + R"(,)";

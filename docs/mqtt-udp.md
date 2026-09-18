@@ -131,6 +131,17 @@ sequenceDiagram
    }
    ```
 
+   监听期间设备还会发送本地 VAD 状态，用于刷新服务端的无人说话计时器：
+
+   ```json
+   {
+     "session_id": "xxx",
+     "type": "listen",
+     "state": "vad",
+     "speaking": true
+   }
+   ```
+
 2. **Abort 消息**
    ```json
    {
@@ -170,6 +181,34 @@ sequenceDiagram
 - **MCP**：物联网控制
 - **System**：系统控制
 - **Custom**：自定义消息（可选）
+
+#### 3.3.3 Otto 动作控制扩展
+
+当设备的 MQTT 配置包含 `subscribe_topic` 时，设备会订阅该主题。控制端可以向该主题发送直接动作 JSON：
+
+```json
+{
+  "type": "otto_action",
+  "id": "mqtt-001",
+  "action": "swing",
+  "steps": 3,
+  "speed": 1000,
+  "direction": 1,
+  "amount": 30
+}
+```
+
+支持的动作包括 `walk`、`turn`、`jump`、`swing`、`moonwalk`、`bend`、`shake_leg`、`updown`、`tiptoe_swing`、`jitter`、`ascending_turn`、`crusaito`、`flapping`、`laugh`、`hands_up`、`hands_down`、`hand_wave` 和 `home`。设备会通过 `publish_topic` 返回 `otto_action_ack`；查询当前状态使用 `otto_query`，查询动作目录使用 `otto_actions`。原有 MCP `tools/call` 方式仍然有效。
+
+`laugh` 不驱动舵机。固件 2.0.11 起，它会在约 2 秒本地音频真正结束前保持动作状态为 `moving`、`sound.busy=true`，随后返回 `idle`；这样 Dispatcher 可以观察到可靠的完成边沿，不会误等 15 秒安全超时。
+
+#### 3.3.4 循环对话生命周期
+
+固件 2.0.11 起，机身按钮是对话模式开关：待机按键发送 `listen/start` 并进入会话；连接、监听或播报期间按键会先发送 `goodbye`，再关闭通道。退出后再次按键会创建新会话。
+
+Otto Master 在同一会话中循环执行本地 `laugh`、监听、ASR、LLM 和流式 TTS。回答完成后不发送 `goodbye`，而是回到下一轮 `laugh`；监听状态连续 8 秒没有收到 `listen/vad speaking=true` 或 ASR 活动时，服务端才以 `idle_timeout` 结束会话。
+
+这条生命周期只负责语音轮次。当前 DeepSeek SSE 请求没有 `tools`/`tool_choice`，服务端也未消费 `tool_calls`，所以对话文本尚不能直接触发本节的 Otto 动作；该桥接必须在服务端单独实现。
 
 ---
 
@@ -267,6 +306,7 @@ bool IsAudioChannelOpened() const {
 - `password`：密码
 - `keepalive`：心跳间隔（默认240秒）
 - `publish_topic`：发布主题
+- `subscribe_topic`：服务器下行控制主题，设备连接后自动订阅
 
 ### 6.2 音频参数
 
@@ -390,4 +430,4 @@ MQTT + UDP 混合协议通过以下设计实现高效的音视频通信：
 - **自动恢复**：支持连接断开后的自动重连
 - **性能优化**：UDP 传输保证音频数据的实时性
 
-该协议适用于对实时性要求较高的语音交互场景，但需要在网络复杂度和传输性能之间做出权衡。 
+该协议适用于对实时性要求较高的语音交互场景，但需要在网络复杂度和传输性能之间做出权衡。

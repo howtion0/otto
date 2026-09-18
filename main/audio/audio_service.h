@@ -137,6 +137,8 @@ private:
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
+    bool audio_decode_active_ = false;
+    bool audio_output_active_ = false;
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
@@ -155,6 +157,7 @@ private:
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
+    void WaitForPlaybackIdle();
     void CheckAndUpdateAudioPowerState();
 };
 

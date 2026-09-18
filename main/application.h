@@ -10,6 +10,7 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <utility>
 
 #include "protocol.h"
 #include "ota.h"
@@ -52,6 +53,7 @@ public:
     void DismissAlert();
     void AbortSpeaking(AbortReason reason);
     void ToggleChatState();
+    void ToggleConversationMode();
     void StartListening();
     void StopListening();
     void Reboot();
@@ -59,10 +61,15 @@ public:
     bool UpgradeFirmware(Ota& ota, const std::string& url = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
+    void SendJsonMessage(const std::string& message);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    void RecordUserText(const std::string& text);
+    void RecordAssistantText(const std::string& text);
+    void RecordVoiceEvent(const char* event);
+    std::string GetVoiceStatusJson() const;
 
 private:
     Application();
@@ -79,6 +86,18 @@ private:
     std::string last_error_message_;
     AudioService audio_service_;
 
+    mutable std::mutex telemetry_mutex_;
+    std::string last_user_text_;
+    std::string last_assistant_text_;
+    std::string last_voice_event_ = "boot";
+    int64_t last_voice_event_ms_ = 0;
+
+    // MQTT is QoS 0, so the server may repeat a command after losing an ACK.
+    // Keep a small bounded response cache so an identical command ID never
+    // executes the physical action twice.
+    mutable std::mutex command_cache_mutex_;
+    std::deque<std::pair<std::string, std::string>> command_response_cache_;
+
     bool has_server_time_ = false;
     bool aborted_ = false;
     int clock_ticks_ = 0;
@@ -90,6 +109,8 @@ private:
     void CheckAssetsVersion();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
+    bool FindCachedCommandResponse(const std::string& command_id, std::string& response) const;
+    void CacheCommandResponse(const std::string& command_id, const std::string& response);
 };
 
 

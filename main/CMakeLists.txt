@@ -27,6 +27,7 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "otto_master_link.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -485,7 +486,8 @@ elseif(CONFIG_BOARD_TYPE_SPOTPEAR_ESP32_S3_1_28_BOX)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 elseif(CONFIG_BOARD_TYPE_OTTO_ROBOT)
     set(BOARD_TYPE "otto-robot")
-    set(BOARD_NAME "catnip")
+    set(OTTO_DEVICE_NAME "EVA1" CACHE STRING "Otto display/device name")
+    set(BOARD_NAME "${OTTO_DEVICE_NAME}")
     set(BUILTIN_TEXT_FONT font_puhui_16_4)
     set(BUILTIN_ICON_FONT font_awesome_16_4)
 elseif(CONFIG_BOARD_TYPE_ELECTRON_BOT)

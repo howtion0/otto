@@ -1,5 +1,6 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
 
 #if CONFIG_USE_AUDIO_PROCESSOR
@@ -266,6 +267,7 @@ void AudioService::AudioOutputTask() {
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
+        audio_output_active_ = true;
         audio_queue_cv_.notify_all();
         lock.unlock();
 
@@ -279,6 +281,11 @@ void AudioService::AudioOutputTask() {
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
         debug_statistics_.playback_count++;
+
+        lock.lock();
+        audio_output_active_ = false;
+        audio_queue_cv_.notify_all();
+        lock.unlock();
 
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
@@ -308,6 +315,7 @@ void AudioService::OpusCodecTask() {
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
+            audio_decode_active_ = true;
             audio_queue_cv_.notify_all();
             lock.unlock();
 
@@ -327,10 +335,13 @@ void AudioService::OpusCodecTask() {
 
                 lock.lock();
                 audio_playback_queue_.push_back(std::move(task));
+                audio_decode_active_ = false;
                 audio_queue_cv_.notify_all();
             } else {
                 ESP_LOGE(TAG, "Failed to decode audio");
                 lock.lock();
+                audio_decode_active_ = false;
+                audio_queue_cv_.notify_all();
             }
             debug_statistics_.decode_count++;
         }
@@ -609,7 +620,14 @@ void AudioService::PlaySound(const std::string_view& ogg) {
             // Audio packet (Opus)
             auto packet = std::make_unique<AudioStreamPacket>();
             packet->sample_rate = sample_rate;
-            packet->frame_duration = 60;
+            const int packet_samples = opus_packet_get_nb_samples(
+                pkt_ptr, static_cast<opus_int32>(pkt_len), sample_rate);
+            if (packet_samples <= 0) {
+                ESP_LOGW(TAG, "Skipping invalid embedded Opus packet (%u bytes)",
+                         static_cast<unsigned>(pkt_len));
+                continue;
+            }
+            packet->frame_duration = std::max(1, packet_samples * 1000 / sample_rate);
             packet->payload.resize(pkt_len);
             std::memcpy(packet->payload.data(), pkt_ptr, pkt_len);
             PushPacketToDecodeQueue(std::move(packet), true);
@@ -617,11 +635,27 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
         offset = body_off + body_size;
     }
+
+    // QueueSound reports completion to the server. Do not clear sound.busy
+    // merely because the compressed packets were enqueued: wait until the
+    // decoder and I2S writer have consumed the final PCM frame.
+    WaitForPlaybackIdle();
 }
 
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+    return audio_encode_queue_.empty() && audio_decode_queue_.empty() &&
+           audio_playback_queue_.empty() && audio_testing_queue_.empty() &&
+           !audio_decode_active_ && !audio_output_active_;
+}
+
+void AudioService::WaitForPlaybackIdle() {
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    audio_queue_cv_.wait(lock, [this]() {
+        return service_stopped_ ||
+               (audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
+                !audio_decode_active_ && !audio_output_active_);
+    });
 }
 
 void AudioService::ResetDecoder() {

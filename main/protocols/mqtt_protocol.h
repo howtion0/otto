@@ -17,7 +17,8 @@
 #include <mutex>
 
 #define MQTT_PING_INTERVAL_SECONDS 90
-#define MQTT_RECONNECT_INTERVAL_MS 60000
+#define MQTT_RECONNECT_INTERVAL_MS 5000
+#define OTTO_FLEET_HEARTBEAT_INTERVAL_MS 5000
 
 #define MQTT_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
 
@@ -36,6 +37,7 @@ private:
     EventGroupHandle_t event_group_handle_;
 
     std::string publish_topic_;
+    std::string subscribe_topic_;
 
     std::mutex channel_mutex_;
     std::unique_ptr<Mqtt> mqtt_;
@@ -43,12 +45,15 @@ private:
     mbedtls_aes_context aes_ctx_;
     std::string aes_nonce_;
     std::string udp_server_;
-    int udp_port_;
-    uint32_t local_sequence_;
-    uint32_t remote_sequence_;
-    esp_timer_handle_t reconnect_timer_;
+    int udp_port_ = 0;
+    uint32_t local_sequence_ = 0;
+    uint32_t remote_sequence_ = 0;
+    esp_timer_handle_t reconnect_timer_ = nullptr;
+    esp_timer_handle_t fleet_heartbeat_timer_ = nullptr;
 
     bool StartMqttClient(bool report_error=false);
+    void ScheduleReconnect();
+    bool SendFleetPresence(const char* type);
     void ParseServerHello(const cJSON* root);
     std::string DecodeHexString(const std::string& hex_string);
 

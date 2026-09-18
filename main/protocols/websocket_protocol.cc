@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <cJSON.h>
+#include <esp_app_desc.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include "assets/lang_config.h"
@@ -76,6 +77,9 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 }
 
 void WebsocketProtocol::CloseAudioChannel() {
+    if (websocket_ != nullptr && websocket_->IsConnected() && !session_id_.empty()) {
+        SendText("{\"session_id\":\"" + session_id_ + "\",\"type\":\"goodbye\"}");
+    }
     websocket_.reset();
 }
 
@@ -83,6 +87,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
+    std::string client_id = settings.GetString("client_id");
     int version = settings.GetInt("version");
     if (version != 0) {
         version_ = version;
@@ -106,7 +111,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
     }
     websocket_->SetHeader("Protocol-Version", std::to_string(version_).c_str());
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
-    websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+    if (client_id.empty()) {
+        client_id = Board::GetInstance().GetUuid();
+    }
+    websocket_->SetHeader("Client-Id", client_id.c_str());
 
     websocket_->OnData([this](const char* data, size_t len, bool binary) {
         if (binary) {
@@ -209,8 +217,17 @@ std::string WebsocketProtocol::GetHelloMessage() {
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
+    cJSON_AddBoolToObject(features, "otto_state", true);
+    cJSON_AddBoolToObject(features, "otto_actions", true);
+    cJSON_AddBoolToObject(features, "otto_stop", true);
     cJSON_AddItemToObject(root, "features", features);
     cJSON_AddStringToObject(root, "transport", "websocket");
+    Settings identity("otto", false);
+    const std::string name = identity.GetString("name", BOARD_NAME);
+    cJSON_AddStringToObject(root, "name", name.c_str());
+    cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
+    cJSON_AddStringToObject(root, "firmware_version",
+                            esp_app_get_description()->version);
     cJSON* audio_params = cJSON_CreateObject();
     cJSON_AddStringToObject(audio_params, "format", "opus");
     cJSON_AddNumberToObject(audio_params, "sample_rate", 16000);

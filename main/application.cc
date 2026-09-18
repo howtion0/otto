@@ -7,6 +7,8 @@
 #include "websocket_protocol.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
+#include "boards/otto-robot/otto_controller_status.h"
+#include "otto_master_link.h"
 #include "assets.h"
 #include "settings.h"
 
@@ -67,6 +69,140 @@ Application::~Application() {
         esp_timer_delete(clock_timer_handle_);
     }
     vEventGroupDelete(event_group_);
+}
+
+namespace {
+
+constexpr size_t kCommandResponseCacheSize = 32;
+
+const char* DeviceStateName(DeviceState state) {
+    const int index = static_cast<int>(state);
+    if (index < 0 || index >= static_cast<int>(sizeof(STATE_STRINGS) / sizeof(STATE_STRINGS[0]))) {
+        return "invalid_state";
+    }
+    return STATE_STRINGS[index];
+}
+
+void CopyJsonId(cJSON* target, const cJSON* id) {
+    if (cJSON_IsString(id)) {
+        cJSON_AddStringToObject(target, "id", id->valuestring);
+    } else if (cJSON_IsNumber(id)) {
+        cJSON_AddNumberToObject(target, "id", id->valuedouble);
+    }
+}
+
+std::string PrintJson(cJSON* root) {
+    char* text = cJSON_PrintUnformatted(root);
+    std::string result = text == nullptr ? "{}" : text;
+    if (text != nullptr) {
+        cJSON_free(text);
+    }
+    cJSON_Delete(root);
+    return result;
+}
+
+void AddOttoRuntime(cJSON* target) {
+    cJSON* otto = cJSON_Parse(GetOttoRuntimeStatusJson().c_str());
+    if (otto != nullptr) {
+        cJSON_AddItemToObject(target, "otto", otto);
+    }
+    cJSON* voice = cJSON_Parse(Application::GetInstance().GetVoiceStatusJson().c_str());
+    if (voice != nullptr) {
+        cJSON_AddItemToObject(target, "voice", voice);
+    }
+}
+
+bool ReadCommandId(const cJSON* root, std::string& command_id) {
+    const cJSON* id = cJSON_GetObjectItem(root, "id");
+    if (!cJSON_IsString(id) || id->valuestring == nullptr) {
+        return false;
+    }
+    command_id = id->valuestring;
+    return !command_id.empty() && command_id.size() <= 128;
+}
+
+}  // namespace
+
+bool Application::FindCachedCommandResponse(const std::string& command_id,
+                                            std::string& response) const {
+    std::lock_guard<std::mutex> lock(command_cache_mutex_);
+    for (auto item = command_response_cache_.rbegin();
+         item != command_response_cache_.rend(); ++item) {
+        if (item->first == command_id) {
+            response = item->second;
+            return true;
+        }
+    }
+    return false;
+}
+
+void Application::CacheCommandResponse(const std::string& command_id,
+                                       const std::string& response) {
+    if (command_id.empty() || response.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(command_cache_mutex_);
+    for (auto item = command_response_cache_.begin();
+         item != command_response_cache_.end(); ++item) {
+        if (item->first == command_id) {
+            item->second = response;
+            return;
+        }
+    }
+    command_response_cache_.emplace_back(command_id, response);
+    while (command_response_cache_.size() > kCommandResponseCacheSize) {
+        command_response_cache_.pop_front();
+    }
+}
+
+void Application::RecordUserText(const std::string& text) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex_);
+    last_user_text_ = text.substr(0, 512);
+    last_voice_event_ = "stt";
+    last_voice_event_ms_ = esp_timer_get_time() / 1000;
+}
+
+void Application::RecordAssistantText(const std::string& text) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex_);
+    last_assistant_text_ = text.substr(0, 512);
+    last_voice_event_ = "tts_sentence";
+    last_voice_event_ms_ = esp_timer_get_time() / 1000;
+}
+
+void Application::RecordVoiceEvent(const char* event) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex_);
+    last_voice_event_ = event == nullptr ? "unknown" : event;
+    last_voice_event_ms_ = esp_timer_get_time() / 1000;
+}
+
+std::string Application::GetVoiceStatusJson() const {
+    std::string last_user_text;
+    std::string last_assistant_text;
+    std::string last_voice_event;
+    int64_t last_voice_event_ms = 0;
+    {
+        std::lock_guard<std::mutex> lock(telemetry_mutex_);
+        last_user_text = last_user_text_;
+        last_assistant_text = last_assistant_text_;
+        last_voice_event = last_voice_event_;
+        last_voice_event_ms = last_voice_event_ms_;
+    }
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "device_state", DeviceStateName(device_state_));
+    cJSON_AddBoolToObject(root, "voice_detected", IsVoiceDetected());
+    cJSON_AddStringToObject(root, "last_event", last_voice_event.c_str());
+    cJSON_AddNumberToObject(root, "last_event_ms", static_cast<double>(last_voice_event_ms));
+    cJSON_AddStringToObject(root, "last_user_text", last_user_text.c_str());
+    cJSON_AddStringToObject(root, "last_assistant_text", last_assistant_text.c_str());
+
+    char* text = cJSON_PrintUnformatted(root);
+    std::string result = text == nullptr ? "{}" : text;
+    if (text != nullptr) {
+        cJSON_free(text);
+    }
+    cJSON_Delete(root);
+    return result;
 }
 
 void Application::CheckAssetsVersion() {
@@ -286,6 +422,40 @@ void Application::ToggleChatState() {
     }
 }
 
+void Application::ToggleConversationMode() {
+    if (device_state_ == kDeviceStateActivating ||
+        device_state_ == kDeviceStateWifiConfiguring ||
+        device_state_ == kDeviceStateAudioTesting) {
+        ToggleChatState();
+        return;
+    }
+
+    if (!protocol_) {
+        ESP_LOGE(TAG, "Protocol not initialized");
+        return;
+    }
+
+    if (device_state_ == kDeviceStateIdle) {
+        ToggleChatState();
+        return;
+    }
+
+    if (device_state_ == kDeviceStateConnecting ||
+        device_state_ == kDeviceStateListening ||
+        device_state_ == kDeviceStateSpeaking) {
+        Schedule([this]() {
+            if (device_state_ == kDeviceStateSpeaking) {
+                AbortSpeaking(kAbortReasonNone);
+            }
+            if (protocol_->IsAudioChannelOpened()) {
+                protocol_->CloseAudioChannel();
+            } else {
+                SetDeviceState(kDeviceStateIdle);
+            }
+        });
+    }
+}
+
 void Application::StartListening() {
     if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -384,6 +554,12 @@ void Application::Start() {
     /* Wait for the network to be ready */
     board.StartNetwork();
 
+#if CONFIG_OTTO_MASTER_LINK
+    // Start the local connection-validation link after DHCP has completed.
+    // This is independent from the normal MQTT/WebSocket voice protocol.
+    OttoMasterLink::GetInstance().Start();
+#endif
+
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 
@@ -402,7 +578,16 @@ void Application::Start() {
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
 
-    if (ota.HasMqttConfig()) {
+    Settings local_identity("otto", false);
+    const std::string preferred_transport =
+        local_identity.GetString("transport", "mqtt");
+    if (preferred_transport == "websocket" && ota.HasWebsocketConfig()) {
+        ESP_LOGI(TAG, "Using locally selected WebSocket transport");
+        protocol_ = std::make_unique<WebsocketProtocol>();
+    } else if (ota.HasMqttConfig()) {
+        if (preferred_transport == "websocket") {
+            ESP_LOGW(TAG, "Preferred WebSocket profile is incomplete; falling back to MQTT");
+        }
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota.HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
@@ -445,6 +630,7 @@ void Application::Start() {
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
+                RecordVoiceEvent("tts_start");
                 Schedule([this]() {
                     aborted_ = false;
                     if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
@@ -452,6 +638,7 @@ void Application::Start() {
                     }
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
+                RecordVoiceEvent("tts_stop");
                 Schedule([this]() {
                     if (device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
@@ -465,6 +652,7 @@ void Application::Start() {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
+                    RecordAssistantText(text->valuestring);
                     Schedule([this, display, message = std::string(text->valuestring)]() {
                         display->SetChatMessage("assistant", message.c_str());
                     });
@@ -474,6 +662,7 @@ void Application::Start() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+                RecordUserText(text->valuestring);
                 Schedule([this, display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -490,6 +679,117 @@ void Application::Start() {
             if (cJSON_IsObject(payload)) {
                 McpServer::GetInstance().ParseMessage(payload);
             }
+        } else if (strcmp(type->valuestring, "otto_action") == 0 ||
+                   strcmp(type->valuestring, "action") == 0) {
+            // Optional direct MQTT control format. MCP tools remain supported
+            // through the branch above, while this is convenient for a robot
+            // fleet controller that only needs a small JSON command.
+            std::string command_id;
+            const bool has_command_id = ReadCommandId(root, command_id);
+            if (strcmp(type->valuestring, "otto_action") == 0 && !has_command_id) {
+                ESP_LOGW(TAG, "Rejected MQTT action without a bounded string id");
+                return;
+            }
+            std::string cached_response;
+            if (has_command_id && FindCachedCommandResponse(command_id, cached_response)) {
+                ESP_LOGI(TAG, "Replaying cached MQTT command response for id=%s",
+                         command_id.c_str());
+                SendJsonMessage(cached_response);
+                return;
+            }
+
+            auto action = cJSON_GetObjectItem(root, "action");
+            if (!cJSON_IsString(action)) {
+                action = cJSON_GetObjectItem(root, "name");
+            }
+            auto steps_json = cJSON_GetObjectItem(root, "steps");
+            auto speed_json = cJSON_GetObjectItem(root, "speed");
+            auto direction_json = cJSON_GetObjectItem(root, "direction");
+            auto amount_json = cJSON_GetObjectItem(root, "amount");
+            const int steps = cJSON_IsNumber(steps_json) ? steps_json->valueint : 3;
+            const int speed = cJSON_IsNumber(speed_json) ? speed_json->valueint : 1000;
+            const int direction = cJSON_IsNumber(direction_json) ? direction_json->valueint : 1;
+            const int amount = cJSON_IsNumber(amount_json) ? amount_json->valueint : 50;
+
+            cJSON* reply = cJSON_CreateObject();
+            CopyJsonId(reply, cJSON_GetObjectItem(root, "id"));
+            cJSON_AddStringToObject(reply, "type", "otto_action_ack");
+            cJSON_AddStringToObject(reply, "source", "mqtt");
+            std::string error;
+            const bool accepted = cJSON_IsString(action) &&
+                                  QueueOttoAction(action->valuestring, steps, speed, direction,
+                                                  amount, error);
+            cJSON_AddBoolToObject(reply, "ok", accepted);
+            if (accepted) {
+                cJSON_AddStringToObject(reply, "action", action->valuestring);
+            } else {
+                cJSON_AddStringToObject(reply, "error",
+                                        error.empty() ? "action 字段必须是字符串" : error.c_str());
+            }
+            // Do not attach an immediate idle snapshot to an accepted action:
+            // the action task may not have consumed its queue item yet. The
+            // dispatcher polls otto_query and observes moving -> idle.
+            std::string response = PrintJson(reply);
+            if (has_command_id) {
+                CacheCommandResponse(command_id, response);
+            }
+            SendJsonMessage(response);
+        } else if (strcmp(type->valuestring, "stop") == 0 ||
+                   strcmp(type->valuestring, "otto_stop") == 0) {
+            std::string command_id;
+            if (!ReadCommandId(root, command_id)) {
+                ESP_LOGW(TAG, "Rejected MQTT stop without a bounded string id");
+                return;
+            }
+            std::string cached_response;
+            if (FindCachedCommandResponse(command_id, cached_response)) {
+                ESP_LOGI(TAG, "Replaying cached MQTT command response for id=%s",
+                         command_id.c_str());
+                SendJsonMessage(cached_response);
+                return;
+            }
+
+            cJSON* reply = cJSON_CreateObject();
+            CopyJsonId(reply, cJSON_GetObjectItem(root, "id"));
+            cJSON_AddStringToObject(reply, "type", "otto_stop_ack");
+            cJSON_AddStringToObject(reply, "source", "mqtt");
+            std::string error;
+            const bool accepted = StopOttoAction(error);
+            cJSON_AddBoolToObject(reply, "ok", accepted);
+            if (!accepted) {
+                cJSON_AddStringToObject(reply, "error", error.c_str());
+            }
+            cJSON* runtime = cJSON_CreateObject();
+            AddOttoRuntime(runtime);
+            cJSON_AddItemToObject(reply, "runtime", runtime);
+            std::string response = PrintJson(reply);
+            CacheCommandResponse(command_id, response);
+            SendJsonMessage(response);
+        } else if (strcmp(type->valuestring, "otto_query") == 0 ||
+                   strcmp(type->valuestring, "query_state") == 0) {
+            cJSON* reply = cJSON_CreateObject();
+            CopyJsonId(reply, cJSON_GetObjectItem(root, "id"));
+            cJSON_AddStringToObject(reply, "type", "otto_state");
+            cJSON_AddStringToObject(reply, "source", "mqtt");
+            cJSON* runtime = cJSON_CreateObject();
+            AddOttoRuntime(runtime);
+            cJSON_AddItemToObject(reply, "runtime", runtime);
+            SendJsonMessage(PrintJson(reply));
+        } else if (strcmp(type->valuestring, "otto_actions") == 0 ||
+                   strcmp(type->valuestring, "list_actions") == 0) {
+            cJSON* reply = cJSON_CreateObject();
+            CopyJsonId(reply, cJSON_GetObjectItem(root, "id"));
+            cJSON_AddStringToObject(reply, "type", "otto_actions");
+            cJSON_AddStringToObject(reply, "source", "mqtt");
+            cJSON* catalog = cJSON_Parse(GetOttoAvailableActionsJson().c_str());
+            if (catalog != nullptr) {
+                cJSON* actions = cJSON_GetObjectItem(catalog, "actions");
+                if (actions != nullptr) {
+                    cJSON_AddItemToObject(reply, "actions", cJSON_Duplicate(actions, 1));
+                }
+                cJSON_Delete(catalog);
+            }
+            SendJsonMessage(PrintJson(reply));
         } else if (strcmp(type->valuestring, "system") == 0) {
             auto command = cJSON_GetObjectItem(root, "command");
             if (cJSON_IsString(command)) {
@@ -585,6 +885,9 @@ void Application::MainEventLoop() {
             if (device_state_ == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+                if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                    protocol_->SendVadState(IsVoiceDetected());
+                }
             }
         }
 
@@ -858,6 +1161,24 @@ void Application::SendMcpMessage(const std::string& payload) {
     } else {
         Schedule([this, payload = std::move(payload)]() {
             protocol_->SendMcpMessage(payload);
+        });
+    }
+}
+
+void Application::SendJsonMessage(const std::string& message) {
+    if (protocol_ == nullptr) {
+        return;
+    }
+
+    // MQTT callbacks run on the MQTT task, while protocol writes are kept on
+    // the main application task to avoid racing protocol/audio state.
+    if (xTaskGetCurrentTaskHandle() == main_event_loop_task_handle_) {
+        protocol_->SendJson(message);
+    } else {
+        Schedule([this, message]() {
+            if (protocol_ != nullptr) {
+                protocol_->SendJson(message);
+            }
         });
     }
 }

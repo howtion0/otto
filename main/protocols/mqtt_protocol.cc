@@ -1,14 +1,139 @@
 #include "mqtt_protocol.h"
 #include "board.h"
 #include "application.h"
+#include "boards/otto-robot/otto_controller_status.h"
 #include "settings.h"
+#include "system_info.h"
 
+#include <esp_app_desc.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cstring>
+#include <cstdlib>
 #include <arpa/inet.h>
 #include "assets/lang_config.h"
 
 #define TAG "MQTT"
+
+namespace {
+
+std::string PrintJson(cJSON* root) {
+    char* text = cJSON_PrintUnformatted(root);
+    std::string result = text == nullptr ? "{}" : text;
+    if (text != nullptr) {
+        cJSON_free(text);
+    }
+    cJSON_Delete(root);
+    return result;
+}
+
+std::string DeviceName() {
+    Settings settings("otto", false);
+    const std::string configured = settings.GetString("name");
+    return configured.empty() ? BOARD_NAME : configured;
+}
+
+bool ParseMqttEndpoint(const std::string& endpoint, std::string& host, int& port) {
+    std::string value = endpoint;
+    port = 8883;
+    if (value.rfind("mqtt://", 0) == 0) {
+        value.erase(0, 7);
+        port = 1883;
+    } else if (value.rfind("mqtts://", 0) == 0) {
+        value.erase(0, 8);
+        port = 8883;
+    }
+
+    const size_t path = value.find('/');
+    if (path != std::string::npos) {
+        if (value.find_first_not_of('/', path) != std::string::npos) {
+            return false;
+        }
+        value.erase(path);
+    }
+    if (value.empty()) {
+        return false;
+    }
+
+    std::string port_text;
+    if (value.front() == '[') {
+        const size_t closing = value.find(']');
+        if (closing == std::string::npos) {
+            return false;
+        }
+        host = value.substr(1, closing - 1);
+        if (closing + 1 < value.size()) {
+            if (value[closing + 1] != ':') {
+                return false;
+            }
+            port_text = value.substr(closing + 2);
+        }
+    } else {
+        const size_t colon = value.rfind(':');
+        if (colon != std::string::npos && value.find(':') == colon) {
+            host = value.substr(0, colon);
+            port_text = value.substr(colon + 1);
+        } else {
+            host = value;
+        }
+    }
+    if (host.empty()) {
+        return false;
+    }
+    if (!port_text.empty()) {
+        char* end = nullptr;
+        const long parsed = std::strtol(port_text.c_str(), &end, 10);
+        if (end == port_text.c_str() || *end != '\0' || parsed < 1 || parsed > 65535) {
+            return false;
+        }
+        port = static_cast<int>(parsed);
+    }
+    return true;
+}
+
+std::string BuildFleetPresence(const char* type) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", type);
+    cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
+    cJSON_AddStringToObject(root, "name", DeviceName().c_str());
+    cJSON_AddNumberToObject(root, "uptime_ms",
+                            static_cast<double>(esp_timer_get_time() / 1000));
+
+    if (strcmp(type, "hello") == 0) {
+        cJSON_AddStringToObject(root, "protocol", "otto-mqtt/1");
+        cJSON_AddStringToObject(root, "firmware_version",
+                                esp_app_get_description()->version);
+        cJSON* capabilities = cJSON_CreateObject();
+        cJSON_AddBoolToObject(capabilities, "actions", true);
+        cJSON_AddBoolToObject(capabilities, "state", true);
+        cJSON_AddBoolToObject(capabilities, "stop", true);
+        cJSON_AddBoolToObject(capabilities, "command_dedup", true);
+        cJSON_AddItemToObject(root, "capabilities", capabilities);
+    }
+
+    cJSON* board = cJSON_Parse(Board::GetInstance().GetBoardJson().c_str());
+    if (board != nullptr) {
+        cJSON* ip = cJSON_GetObjectItem(board, "ip");
+        if (cJSON_IsString(ip) && ip->valuestring != nullptr) {
+            cJSON_AddStringToObject(root, "ip_address", ip->valuestring);
+        }
+        cJSON_AddItemToObject(root, "board", board);
+    }
+
+    cJSON* runtime = cJSON_CreateObject();
+    cJSON* otto = cJSON_Parse(GetOttoRuntimeStatusJson().c_str());
+    if (otto != nullptr) {
+        cJSON_AddItemToObject(runtime, "otto", otto);
+    }
+    cJSON* voice = cJSON_Parse(Application::GetInstance().GetVoiceStatusJson().c_str());
+    if (voice != nullptr) {
+        cJSON_AddItemToObject(runtime, "voice", voice);
+    }
+    cJSON_AddItemToObject(root, "runtime", runtime);
+    return PrintJson(root);
+}
+
+}  // namespace
 
 MqttProtocol::MqttProtocol() {
     event_group_handle_ = xEventGroupCreate();
@@ -18,16 +143,22 @@ MqttProtocol::MqttProtocol() {
         .callback = [](void* arg) {
             MqttProtocol* protocol = (MqttProtocol*)arg;
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateIdle) {
-                ESP_LOGI(TAG, "Reconnecting to MQTT server");
-                app.Schedule([protocol]() {
-                    protocol->StartMqttClient(false);
-                });
-            }
+            ESP_LOGI(TAG, "Reconnecting to MQTT server");
+            app.Schedule([protocol]() {
+                protocol->StartMqttClient(false);
+            });
         },
         .arg = this,
     };
     esp_timer_create(&reconnect_timer_args, &reconnect_timer_);
+
+    esp_timer_create_args_t heartbeat_timer_args = {
+        .callback = [](void*) {
+            Application::GetInstance().SendJsonMessage(BuildFleetPresence("heartbeat"));
+        },
+        .arg = this,
+    };
+    esp_timer_create(&heartbeat_timer_args, &fleet_heartbeat_timer_);
 }
 
 MqttProtocol::~MqttProtocol() {
@@ -35,6 +166,10 @@ MqttProtocol::~MqttProtocol() {
     if (reconnect_timer_ != nullptr) {
         esp_timer_stop(reconnect_timer_);
         esp_timer_delete(reconnect_timer_);
+    }
+    if (fleet_heartbeat_timer_ != nullptr) {
+        esp_timer_stop(fleet_heartbeat_timer_);
+        esp_timer_delete(fleet_heartbeat_timer_);
     }
 
     udp_.reset();
@@ -47,6 +182,18 @@ MqttProtocol::~MqttProtocol() {
 
 bool MqttProtocol::Start() {
     return StartMqttClient(false);
+}
+
+void MqttProtocol::ScheduleReconnect() {
+    if (reconnect_timer_ == nullptr) {
+        return;
+    }
+    esp_timer_stop(reconnect_timer_);
+    esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000ULL);
+}
+
+bool MqttProtocol::SendFleetPresence(const char* type) {
+    return SendText(BuildFleetPresence(type));
 }
 
 bool MqttProtocol::StartMqttClient(bool report_error) {
@@ -62,6 +209,7 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     auto password = settings.GetString("password");
     int keepalive_interval = settings.GetInt("keepalive", 240);
     publish_topic_ = settings.GetString("publish_topic");
+    subscribe_topic_ = settings.GetString("subscribe_topic");
 
     if (endpoint.empty()) {
         ESP_LOGW(TAG, "MQTT endpoint is not specified");
@@ -76,11 +224,14 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     mqtt_->SetKeepAlive(keepalive_interval);
 
     mqtt_->OnDisconnected([this]() {
+        if (fleet_heartbeat_timer_ != nullptr) {
+            esp_timer_stop(fleet_heartbeat_timer_);
+        }
         if (on_disconnected_ != nullptr) {
             on_disconnected_();
         }
         ESP_LOGI(TAG, "MQTT disconnected, schedule reconnect in %d seconds", MQTT_RECONNECT_INTERVAL_MS / 1000);
-        esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
+        ScheduleReconnect();
     });
 
     mqtt_->OnConnected([this]() {
@@ -120,32 +271,56 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         last_incoming_time_ = std::chrono::steady_clock::now();
     });
 
-    ESP_LOGI(TAG, "Connecting to endpoint %s", endpoint.c_str());
     std::string broker_address;
-    int broker_port = 8883;
-    size_t pos = endpoint.find(':');
-    if (pos != std::string::npos) {
-        broker_address = endpoint.substr(0, pos);
-        broker_port = std::stoi(endpoint.substr(pos + 1));
-    } else {
-        broker_address = endpoint;
+    int broker_port = 0;
+    if (!ParseMqttEndpoint(endpoint, broker_address, broker_port)) {
+        ESP_LOGE(TAG, "Invalid MQTT endpoint");
+        SetError(Lang::Strings::SERVER_NOT_FOUND);
+        ScheduleReconnect();
+        return false;
     }
+    ESP_LOGI(TAG, "Connecting to MQTT host %s:%d", broker_address.c_str(), broker_port);
     if (!mqtt_->Connect(broker_address, broker_port, client_id, username, password)) {
         ESP_LOGE(TAG, "Failed to connect to endpoint");
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        ScheduleReconnect();
         return false;
     }
 
-    ESP_LOGI(TAG, "Connected to endpoint");
+    if (!subscribe_topic_.empty()) {
+        if (!mqtt_->Subscribe(subscribe_topic_)) {
+            ESP_LOGE(TAG, "Failed to subscribe to topic %s", subscribe_topic_.c_str());
+            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+            mqtt_->Disconnect();
+            return false;
+        }
+        ESP_LOGI(TAG, "Subscribed to topic %s", subscribe_topic_.c_str());
+    } else {
+        ESP_LOGW(TAG, "No MQTT subscribe_topic configured; server downlink is disabled");
+    }
+
+    if (!SendFleetPresence("hello")) {
+        ESP_LOGE(TAG, "Failed to publish fleet hello");
+        mqtt_->Disconnect();
+        return false;
+    }
+    if (fleet_heartbeat_timer_ != nullptr) {
+        esp_timer_stop(fleet_heartbeat_timer_);
+        esp_timer_start_periodic(fleet_heartbeat_timer_,
+                                 OTTO_FLEET_HEARTBEAT_INTERVAL_MS * 1000ULL);
+    }
+
+    ESP_LOGI(TAG, "Connected to endpoint and published fleet hello");
     return true;
 }
 
 bool MqttProtocol::SendText(const std::string& text) {
-    if (publish_topic_.empty()) {
+    if (publish_topic_.empty() || mqtt_ == nullptr || !mqtt_->IsConnected()) {
         return false;
     }
     if (!mqtt_->Publish(publish_topic_, text)) {
-        ESP_LOGE(TAG, "Failed to publish message: %s", text.c_str());
+        ESP_LOGE(TAG, "Failed to publish MQTT message (%u bytes)",
+                 static_cast<unsigned>(text.size()));
         SetError(Lang::Strings::SERVER_ERROR);
         return false;
     }

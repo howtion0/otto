@@ -85,7 +85,7 @@ private:
                 !WifiStation::GetInstance().IsConnected()) {
                 ResetWifiConfiguration();
             }
-            app.ToggleChatState();
+            app.ToggleConversationMode();
         });
     }
 

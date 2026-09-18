@@ -4,6 +4,7 @@
 
 #include <cJSON.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include <cstring>
 #include <atomic>
@@ -22,45 +23,6 @@
 
 class OttoController {
 private:
-    Otto otto_;
-    TaskHandle_t action_task_handle_ = nullptr;
-    QueueHandle_t action_queue_;
-    bool has_hands_ = false;
-    bool is_action_in_progress_ = false;
-    QueueHandle_t sound_queue_ = nullptr;
-    std::atomic<bool> sound_busy_{false};
-
-    static void SoundTask(void* arg) {
-        auto* controller = static_cast<OttoController*>(arg);
-        std::string_view sound;
-        while (true) {
-            if (xQueueReceive(controller->sound_queue_, &sound, portMAX_DELAY) == pdTRUE) {
-                Application::GetInstance().PlaySound(sound);
-                controller->sound_busy_.store(false);
-            }
-        }
-    }
-
-    // All callers pass embedded assets, whose data remains valid for this task.
-    bool QueueSound(std::string_view sound) {
-        if (sound_queue_ == nullptr || sound.empty() || sound_busy_.exchange(true)) {
-            return false;
-        }
-        if (xQueueSend(sound_queue_, &sound, 0) != pdTRUE) {
-            sound_busy_.store(false);
-            return false;
-        }
-        return true;
-    }
-
-    struct OttoActionParams {
-        int action_type;
-        int steps;
-        int speed;
-        int direction;
-        int amount;
-    };
-
     enum ActionType {
         ACTION_WALK = 1,
         ACTION_TURN = 2,
@@ -78,7 +40,110 @@ private:
         ACTION_HANDS_UP = 14,
         ACTION_HANDS_DOWN = 15,
         ACTION_HAND_WAVE = 16,
-        ACTION_HOME = 17
+        ACTION_HOME = 17,
+        ACTION_LAUGH = 18
+    };
+
+    Otto otto_;
+    TaskHandle_t action_task_handle_ = nullptr;
+    QueueHandle_t action_queue_;
+    bool has_hands_ = false;
+    std::atomic<bool> is_action_in_progress_{false};
+    QueueHandle_t sound_queue_ = nullptr;
+    std::atomic<bool> sound_busy_{false};
+
+    std::atomic<int> current_action_type_{0};
+    std::atomic<int> current_action_steps_{0};
+    std::atomic<int> current_action_speed_{0};
+    std::atomic<int> current_action_direction_{0};
+    std::atomic<int> current_action_amount_{0};
+    std::atomic<int> last_action_type_{ACTION_HOME};
+    std::atomic<int> last_action_steps_{1};
+    std::atomic<int> last_action_speed_{1000};
+    std::atomic<int> last_action_direction_{1};
+    std::atomic<int> last_action_amount_{0};
+    std::atomic<int64_t> action_started_at_ms_{0};
+    std::atomic<int64_t> last_action_finished_at_ms_{0};
+    std::atomic<int> current_sound_action_type_{0};
+
+    static const char* ActionName(int action_type) {
+        switch (action_type) {
+            case ACTION_WALK: return "walk";
+            case ACTION_TURN: return "turn";
+            case ACTION_JUMP: return "jump";
+            case ACTION_SWING: return "swing";
+            case ACTION_MOONWALK: return "moonwalk";
+            case ACTION_BEND: return "bend";
+            case ACTION_SHAKE_LEG: return "shake_leg";
+            case ACTION_UPDOWN: return "updown";
+            case ACTION_TIPTOE_SWING: return "tiptoe_swing";
+            case ACTION_JITTER: return "jitter";
+            case ACTION_ASCENDING_TURN: return "ascending_turn";
+            case ACTION_CRUSAITO: return "crusaito";
+            case ACTION_FLAPPING: return "flapping";
+            case ACTION_HANDS_UP: return "hands_up";
+            case ACTION_HANDS_DOWN: return "hands_down";
+            case ACTION_HAND_WAVE: return "hand_wave";
+            case ACTION_HOME: return "home";
+            case ACTION_LAUGH: return "laugh";
+            default: return "idle";
+        }
+    }
+
+    static int ActionTypeFromName(const std::string& name) {
+        if (name == "walk" || name == "walk_forward") return ACTION_WALK;
+        if (name == "turn" || name == "turn_left") return ACTION_TURN;
+        if (name == "jump") return ACTION_JUMP;
+        if (name == "swing") return ACTION_SWING;
+        if (name == "moonwalk") return ACTION_MOONWALK;
+        if (name == "bend") return ACTION_BEND;
+        if (name == "shake_leg") return ACTION_SHAKE_LEG;
+        if (name == "updown") return ACTION_UPDOWN;
+        if (name == "tiptoe_swing") return ACTION_TIPTOE_SWING;
+        if (name == "jitter") return ACTION_JITTER;
+        if (name == "ascending_turn") return ACTION_ASCENDING_TURN;
+        if (name == "crusaito") return ACTION_CRUSAITO;
+        if (name == "flapping") return ACTION_FLAPPING;
+        if (name == "hands_up") return ACTION_HANDS_UP;
+        if (name == "hands_down") return ACTION_HANDS_DOWN;
+        if (name == "hand_wave") return ACTION_HAND_WAVE;
+        if (name == "home") return ACTION_HOME;
+        if (name == "laugh") return ACTION_LAUGH;
+        return 0;
+    }
+
+    static void SoundTask(void* arg) {
+        auto* controller = static_cast<OttoController*>(arg);
+        std::string_view sound;
+        while (true) {
+            if (xQueueReceive(controller->sound_queue_, &sound, portMAX_DELAY) == pdTRUE) {
+                Application::GetInstance().PlaySound(sound);
+                controller->sound_busy_.store(false);
+                controller->current_sound_action_type_.store(0);
+            }
+        }
+    }
+
+    // All callers pass embedded assets, whose data remains valid for this task.
+    bool QueueSound(std::string_view sound, int sound_action_type = 0) {
+        if (sound_queue_ == nullptr || sound.empty() || sound_busy_.exchange(true)) {
+            return false;
+        }
+        current_sound_action_type_.store(sound_action_type);
+        if (xQueueSend(sound_queue_, &sound, 0) != pdTRUE) {
+            sound_busy_.store(false);
+            current_sound_action_type_.store(0);
+            return false;
+        }
+        return true;
+    }
+
+    struct OttoActionParams {
+        int action_type;
+        int steps;
+        int speed;
+        int direction;
+        int amount;
     };
 
     std::string_view GetActionSound(int action_type) const {
@@ -87,6 +152,8 @@ private:
                 return Lang::Sounds::OGG_ACTION_WALK;
             case ACTION_SWING:
                 return Lang::Sounds::OGG_ACTION_SWING;
+            case ACTION_LAUGH:
+                return Lang::Sounds::OGG_NAILONG_LAUGH;
             case ACTION_TURN:
             case ACTION_JUMP:
                 return Lang::Sounds::OGG_ACTION_TURN_JUMP;
@@ -118,12 +185,35 @@ private:
         while (true) {
             if (xQueueReceive(controller->action_queue_, &params, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 ESP_LOGI(TAG, "执行动作: %d", params.action_type);
-                controller->is_action_in_progress_ = true;
+                controller->current_action_type_.store(params.action_type);
+                controller->current_action_steps_.store(params.steps);
+                controller->current_action_speed_.store(params.speed);
+                controller->current_action_direction_.store(params.direction);
+                controller->current_action_amount_.store(params.amount);
+                controller->action_started_at_ms_.store(esp_timer_get_time() / 1000);
+                controller->is_action_in_progress_.store(true);
 
                 // Enqueue without waiting for audio decoding so motion starts immediately.
+                // A laugh has no servo movement, so keep its action lifecycle active until
+                // the local sound has really drained. This gives the controller a real
+                // moving -> idle edge and prevents the dispatcher from holding a phantom
+                // command until its safety timeout.
                 auto action_sound = controller->GetActionSound(params.action_type);
+                bool sound_queued = false;
                 if (!action_sound.empty()) {
-                    controller->QueueSound(action_sound);
+                    if (params.action_type == ACTION_LAUGH) {
+                        constexpr int kSoundRetryDelayMs = 20;
+                        constexpr int kSoundRetryAttempts = 250;
+                        for (int attempt = 0; attempt < kSoundRetryAttempts; ++attempt) {
+                            if (controller->QueueSound(action_sound, params.action_type)) {
+                                sound_queued = true;
+                                break;
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(kSoundRetryDelayMs));
+                        }
+                    } else {
+                        sound_queued = controller->QueueSound(action_sound, params.action_type);
+                    }
                 }
 
                 switch (params.action_type) {
@@ -189,11 +279,29 @@ private:
                     case ACTION_HOME:
                         controller->otto_.Home(params.direction == 1);
                         break;
+                    case ACTION_LAUGH:
+                        break;
                 }
-                if (params.action_type != ACTION_HOME) {
+                if (params.action_type == ACTION_LAUGH) {
+                    if (!sound_queued) {
+                        ESP_LOGW(TAG, "奶龙笑声音频在等待5秒后仍未能入队");
+                    } else {
+                        while (controller->sound_busy_.load()) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        }
+                    }
+                }
+                if (params.action_type != ACTION_HOME && params.action_type != ACTION_LAUGH) {
                     controller->otto_.Home(params.action_type < ACTION_HANDS_UP);
                 }
-                controller->is_action_in_progress_ = false;
+                controller->last_action_type_.store(params.action_type);
+                controller->last_action_steps_.store(params.steps);
+                controller->last_action_speed_.store(params.speed);
+                controller->last_action_direction_.store(params.direction);
+                controller->last_action_amount_.store(params.amount);
+                controller->last_action_finished_at_ms_.store(esp_timer_get_time() / 1000);
+                controller->current_action_type_.store(0);
+                controller->is_action_in_progress_.store(false);
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
         }
@@ -238,6 +346,143 @@ private:
     }
 
 public:
+    bool QueueActionByName(const std::string& action_name, int steps, int speed, int direction,
+                           int amount, std::string& error) {
+        const int action_type = ActionTypeFromName(action_name);
+        if (action_type == 0) {
+            error = "未知动作: " + action_name;
+            return false;
+        }
+        if (steps < 1 || steps > 100) {
+            error = "steps 必须在 1-100 之间";
+            return false;
+        }
+        if (speed < 500 || speed > 1500) {
+            error = "speed 必须在 500-1500 之间";
+            return false;
+        }
+        if (direction < -1 || direction > 1) {
+            error = "direction 必须是 -1、0 或 1";
+            return false;
+        }
+        if (amount < 0 || amount > 170) {
+            error = "amount 必须在 0-170 之间";
+            return false;
+        }
+        if (action_type >= ACTION_HANDS_UP && action_type <= ACTION_HAND_WAVE && !has_hands_) {
+            error = "当前 Otto 没有配置手部舵机";
+            return false;
+        }
+        QueueAction(action_type, steps, speed, direction, amount);
+        return true;
+    }
+
+    void StopAction() {
+        if (action_task_handle_ != nullptr) {
+            vTaskDelete(action_task_handle_);
+            action_task_handle_ = nullptr;
+        }
+        is_action_in_progress_.store(false);
+        current_action_type_.store(0);
+        if (action_queue_ != nullptr) {
+            xQueueReset(action_queue_);
+        }
+        QueueAction(ACTION_HOME, 1, 1000, 1, 0);
+    }
+
+    std::string GetAvailableActionsJson() const {
+        cJSON* root = cJSON_CreateObject();
+        cJSON* actions = cJSON_CreateArray();
+        auto add_action = [actions](const char* name) {
+            cJSON* action = cJSON_CreateObject();
+            cJSON_AddStringToObject(action, "name", name);
+            cJSON* parameters = cJSON_CreateObject();
+            auto add_integer = [parameters](const char* parameter_name, int minimum,
+                                            int maximum, int default_value) {
+                cJSON* descriptor = cJSON_CreateObject();
+                cJSON_AddStringToObject(descriptor, "type", "integer");
+                cJSON_AddNumberToObject(descriptor, "minimum", minimum);
+                cJSON_AddNumberToObject(descriptor, "maximum", maximum);
+                cJSON_AddNumberToObject(descriptor, "default", default_value);
+                cJSON_AddItemToObject(parameters, parameter_name, descriptor);
+            };
+            add_integer("steps", 1, 100, 3);
+            add_integer("speed", 500, 1500, 1000);
+            add_integer("direction", -1, 1, 1);
+            add_integer("amount", 0, 170, 50);
+            cJSON_AddItemToObject(action, "parameters", parameters);
+            cJSON_AddItemToArray(actions, action);
+        };
+        const int action_types[] = {
+            ACTION_WALK, ACTION_TURN, ACTION_JUMP, ACTION_SWING, ACTION_MOONWALK,
+            ACTION_BEND, ACTION_SHAKE_LEG, ACTION_UPDOWN, ACTION_TIPTOE_SWING, ACTION_JITTER,
+            ACTION_ASCENDING_TURN, ACTION_CRUSAITO, ACTION_FLAPPING, ACTION_LAUGH,
+        };
+        for (int action_type : action_types) {
+            add_action(ActionName(action_type));
+        }
+        if (has_hands_) {
+            add_action(ActionName(ACTION_HANDS_UP));
+            add_action(ActionName(ACTION_HANDS_DOWN));
+            add_action(ActionName(ACTION_HAND_WAVE));
+        }
+        add_action(ActionName(ACTION_HOME));
+        cJSON_AddItemToObject(root, "actions", actions);
+        char* text = cJSON_PrintUnformatted(root);
+        std::string result = text == nullptr ? "{\"actions\":[]}" : text;
+        if (text != nullptr) {
+            cJSON_free(text);
+        }
+        cJSON_Delete(root);
+        return result;
+    }
+
+    std::string GetRuntimeStatusJson() const {
+        cJSON* root = cJSON_CreateObject();
+        const bool moving = is_action_in_progress_.load();
+        const int current_type = current_action_type_.load();
+        const int last_type = last_action_type_.load();
+
+        cJSON* action = cJSON_CreateObject();
+        cJSON_AddStringToObject(action, "state", moving ? "moving" : "idle");
+        cJSON_AddStringToObject(action, "name", ActionName(current_type));
+        cJSON_AddNumberToObject(action, "type", current_type);
+        cJSON_AddNumberToObject(action, "steps", current_action_steps_.load());
+        cJSON_AddNumberToObject(action, "speed", current_action_speed_.load());
+        cJSON_AddNumberToObject(action, "direction", current_action_direction_.load());
+        cJSON_AddNumberToObject(action, "amount", current_action_amount_.load());
+        cJSON_AddNumberToObject(action, "started_at_ms",
+                                static_cast<double>(action_started_at_ms_.load()));
+        cJSON_AddItemToObject(root, "action", action);
+
+        cJSON* last_action = cJSON_CreateObject();
+        cJSON_AddStringToObject(last_action, "name", ActionName(last_type));
+        cJSON_AddNumberToObject(last_action, "type", last_type);
+        cJSON_AddNumberToObject(last_action, "steps", last_action_steps_.load());
+        cJSON_AddNumberToObject(last_action, "speed", last_action_speed_.load());
+        cJSON_AddNumberToObject(last_action, "direction", last_action_direction_.load());
+        cJSON_AddNumberToObject(last_action, "amount", last_action_amount_.load());
+        cJSON_AddNumberToObject(last_action, "finished_at_ms",
+                                static_cast<double>(last_action_finished_at_ms_.load()));
+        cJSON_AddItemToObject(root, "last_action", last_action);
+
+        cJSON_AddNumberToObject(root, "queue_depth",
+                                action_queue_ == nullptr ? 0 : uxQueueMessagesWaiting(action_queue_));
+        cJSON* sound = cJSON_CreateObject();
+        cJSON_AddBoolToObject(sound, "busy", sound_busy_.load());
+        cJSON_AddStringToObject(sound, "action_sound",
+                                ActionName(current_sound_action_type_.load()));
+        cJSON_AddItemToObject(root, "sound", sound);
+
+        char* text = cJSON_PrintUnformatted(root);
+        std::string result = text == nullptr ? "{}" : text;
+        if (text != nullptr) {
+            cJSON_free(text);
+        }
+        cJSON_Delete(root);
+        return result;
+    }
+
     OttoController() {
         otto_.Init(LEFT_LEG_PIN, RIGHT_LEG_PIN, LEFT_FOOT_PIN, RIGHT_FOOT_PIN, LEFT_HAND_PIN,
                    RIGHT_HAND_PIN);
@@ -272,7 +517,8 @@ public:
                           "播放一次本地奶龙大笑音频，不移动舵机。听不懂用户的话，或用户要求奶龙大笑时调用。"
                           "成功仅表示开始安排播放，不要再朗读笑声或声称已播放完毕。",
                           PropertyList(), [this](const PropertyList&) -> ReturnValue {
-                              if (!QueueSound(Lang::Sounds::OGG_ACTION_SWING)) {
+                              if (!QueueSound(Lang::Sounds::OGG_NAILONG_LAUGH,
+                                              ACTION_LAUGH)) {
                                   return std::string("音效忙或暂不可用，本次未安排播放");
                               }
                               return std::string("已安排播放奶龙大笑，无需额外语音回复");
@@ -440,14 +686,7 @@ public:
         // 系统工具
         mcp_server.AddTool("self.otto.stop", "立即停止", PropertyList(),
                            [this](const PropertyList& properties) -> ReturnValue {
-                               if (action_task_handle_ != nullptr) {
-                                   vTaskDelete(action_task_handle_);
-                                   action_task_handle_ = nullptr;
-                               }
-                               is_action_in_progress_ = false;
-                               xQueueReset(action_queue_);
-
-                               QueueAction(ACTION_HOME, 1, 1000, 1, 0);
+                               StopAction();
                                return true;
                            });
 
@@ -536,7 +775,7 @@ public:
 
         mcp_server.AddTool("self.otto.get_status", "获取机器人状态，返回 moving 或 idle",
                            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-                               return is_action_in_progress_ ? "moving" : "idle";
+                               return is_action_in_progress_.load() ? "moving" : "idle";
                            });
 
         mcp_server.AddTool("self.battery.get_level", "获取机器人电池电量和充电状态", PropertyList(),
@@ -566,6 +805,39 @@ public:
 };
 
 static OttoController* g_otto_controller = nullptr;
+
+bool QueueOttoAction(const std::string& action_name, int steps, int speed, int direction,
+                     int amount, std::string& error) {
+    if (g_otto_controller == nullptr) {
+        error = "Otto 控制器尚未初始化";
+        return false;
+    }
+    return g_otto_controller->QueueActionByName(action_name, steps, speed, direction, amount,
+                                                  error);
+}
+
+bool StopOttoAction(std::string& error) {
+    if (g_otto_controller == nullptr) {
+        error = "Otto 控制器尚未初始化";
+        return false;
+    }
+    g_otto_controller->StopAction();
+    return true;
+}
+
+std::string GetOttoAvailableActionsJson() {
+    if (g_otto_controller == nullptr) {
+        return R"({"actions":[]})";
+    }
+    return g_otto_controller->GetAvailableActionsJson();
+}
+
+std::string GetOttoRuntimeStatusJson() {
+    if (g_otto_controller == nullptr) {
+        return R"({"action":{"state":"uninitialized","name":"unknown"},"queue_depth":0})";
+    }
+    return g_otto_controller->GetRuntimeStatusJson();
+}
 
 void InitializeOttoController() {
     if (g_otto_controller == nullptr) {

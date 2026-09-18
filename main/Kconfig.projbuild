@@ -670,6 +670,25 @@ config RECEIVE_CUSTOM_MESSAGE
     help
         Enable custom message reception, allow the device to receive custom messages from the server (preferably through the MQTT protocol)
 
+menu "Otto Local Master Link"
+    depends on BOARD_TYPE_OTTO_ROBOT
+
+    config OTTO_MASTER_LINK
+        bool "Enable local master connection test"
+        default y
+        help
+            Resolve master.local through mDNS and connect to the lightweight
+            local validation server over a newline-delimited JSON TCP link.
+
+    config OTTO_MASTER_PORT
+        int "Local master TCP port"
+        default 8765
+        range 1024 65535
+        depends on OTTO_MASTER_LINK
+        help
+            TCP port used by the local master validation server.
+endmenu
+
 menu "Camera Configuration"
     depends on !IDF_TARGET_ESP32
 

@@ -140,8 +140,20 @@ bool Ota::CheckVersion() {
     }
 
     has_mqtt_config_ = false;
+    Settings local_identity("otto", false);
+    Settings local_mqtt("mqtt", false);
+    const bool local_mqtt_ready =
+        local_identity.GetBool("mqtt_locked", false) &&
+        !local_mqtt.GetString("endpoint").empty() &&
+        !local_mqtt.GetString("client_id").empty() &&
+        !local_mqtt.GetString("password").empty() &&
+        !local_mqtt.GetString("publish_topic").empty() &&
+        !local_mqtt.GetString("subscribe_topic").empty();
     cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
-    if (cJSON_IsObject(mqtt)) {
+    if (local_mqtt_ready) {
+        has_mqtt_config_ = true;
+        ESP_LOGI(TAG, "Using locked local MQTT provisioning");
+    } else if (cJSON_IsObject(mqtt)) {
         Settings settings("mqtt", true);
         cJSON *item = NULL;
         cJSON_ArrayForEach(item, mqtt) {
@@ -161,8 +173,18 @@ bool Ota::CheckVersion() {
     }
 
     has_websocket_config_ = false;
+    Settings local_websocket("websocket", false);
+    const bool local_websocket_ready =
+        local_identity.GetBool("mqtt_locked", false) &&
+        !local_websocket.GetString("url").empty() &&
+        !local_websocket.GetString("client_id").empty() &&
+        !local_websocket.GetString("token").empty() &&
+        local_websocket.GetInt("version", 0) == 1;
     cJSON *websocket = cJSON_GetObjectItem(root, "websocket");
-    if (cJSON_IsObject(websocket)) {
+    if (local_websocket_ready) {
+        has_websocket_config_ = true;
+        ESP_LOGI(TAG, "Using locked local WebSocket provisioning");
+    } else if (cJSON_IsObject(websocket)) {
         Settings settings("websocket", true);
         cJSON *item = NULL;
         cJSON_ArrayForEach(item, websocket) {

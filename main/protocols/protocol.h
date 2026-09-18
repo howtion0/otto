@@ -71,8 +71,12 @@ public:
     virtual void SendWakeWordDetected(const std::string& wake_word);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();
+    virtual void SendVadState(bool speaking);
     virtual void SendAbortSpeaking(AbortReason reason);
     virtual void SendMcpMessage(const std::string& message);
+    // Send a protocol-native JSON control message (used by the Otto MQTT
+    // command extension for acknowledgements and state reports).
+    void SendJson(const std::string& message);
 
 protected:
     std::function<void(const cJSON* root)> on_incoming_json_;
@@ -95,4 +99,3 @@ protected:
 };
 
 #endif // PROTOCOL_H
-
