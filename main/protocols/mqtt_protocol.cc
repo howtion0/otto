@@ -108,6 +108,7 @@ std::string BuildFleetPresence(const char* type) {
         cJSON_AddBoolToObject(capabilities, "state", true);
         cJSON_AddBoolToObject(capabilities, "stop", true);
         cJSON_AddBoolToObject(capabilities, "command_dedup", true);
+        cJSON_AddBoolToObject(capabilities, "conversation_control", true);
         cJSON_AddItemToObject(root, "capabilities", capabilities);
     }
 

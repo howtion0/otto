@@ -2,50 +2,55 @@
 #include "lvgl_theme.h"
 
 #include <esp_log.h>
-#include <font_awesome.h>
 
-#include <algorithm>
 #include <cstring>
-#include <string>
 
 #include "display/lcd_display.h"
 
 #define TAG "OttoEmojiDisplay"
 
-// 表情映射表 - 将原版21种表情映射到现有6个GIF
-const OttoEmojiDisplay::EmotionMap OttoEmojiDisplay::emotion_maps_[] = {
-    // 中性/平静类表情 -> staticstate
-    {"neutral", &staticstate},
-    {"relaxed", &staticstate},
-    {"sleepy", &staticstate},
+// 保持小智协议的21种表情名称不变，并为Otto动作增加中央贴图别名。
+const OttoEmojiDisplay::ImageMap OttoEmojiDisplay::image_maps_[] = {
+    {"neutral", &emotion_neutral},
+    {"happy", &emotion_happy},
+    {"laughing", &emotion_laughing},
+    {"funny", &emotion_funny},
+    {"sad", &emotion_sad},
+    {"angry", &emotion_angry},
+    {"crying", &emotion_crying},
+    {"loving", &emotion_loving},
+    {"embarrassed", &emotion_embarrassed},
+    {"surprised", &emotion_surprised},
+    {"shocked", &emotion_shocked},
+    {"thinking", &emotion_thinking},
+    {"winking", &emotion_winking},
+    {"cool", &emotion_cool},
+    {"relaxed", &emotion_relaxed},
+    {"delicious", &emotion_delicious},
+    {"kissy", &emotion_kissy},
+    {"confident", &emotion_confident},
+    {"sleepy", &emotion_sleepy},
+    {"silly", &emotion_silly},
+    {"confused", &emotion_confused},
 
-    // 积极/开心类表情 -> happy
-    {"happy", &happy},
-    {"laughing", &happy},
-    {"funny", &happy},
-    {"loving", &happy},
-    {"confident", &happy},
-    {"winking", &happy},
-    {"cool", &happy},
-    {"delicious", &happy},
-    {"kissy", &happy},
-    {"silly", &happy},
-
-    // 悲伤类表情 -> sad
-    {"sad", &sad},
-    {"crying", &sad},
-
-    // 愤怒类表情 -> anger
-    {"angry", &anger},
-
-    // 惊讶类表情 -> scare
-    {"surprised", &scare},
-    {"shocked", &scare},
-
-    // 思考/困惑类表情 -> buxue
-    {"thinking", &buxue},
-    {"confused", &buxue},
-    {"embarrassed", &buxue},
+    {"action_walk", &action_walk},
+    {"action_turn", &action_turn},
+    {"action_jump", &action_jump},
+    {"action_swing", &action_swing},
+    {"action_moonwalk", &action_moonwalk},
+    {"action_bend", &action_bend},
+    {"action_shake_leg", &action_shake_leg},
+    {"action_updown", &action_updown},
+    {"action_tiptoe_swing", &action_swing},
+    {"action_jitter", &action_fitness},
+    {"action_ascending_turn", &action_turn},
+    {"action_crusaito", &action_whirlwind_leg},
+    {"action_flapping", &action_windmill},
+    {"action_hands_up", &action_hands_up},
+    {"action_hands_down", &action_hands_down},
+    {"action_hand_wave", &action_hand_wave},
+    {"action_home", &action_home},
+    {"action_laugh", &emotion_laughing},
 
     {nullptr, nullptr}  // 结束标记
 };
@@ -54,11 +59,13 @@ OttoEmojiDisplay::OttoEmojiDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
                                    int width, int height, int offset_x, int offset_y, bool mirror_x,
                                    bool mirror_y, bool swap_xy)
     : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy),
-      emotion_gif_(nullptr) {
-    SetupGifContainer();
+      emotion_image_(nullptr),
+      base_image_(&emotion_neutral),
+      action_active_(false) {
+    SetupImageContainer();
 };
 
-void OttoEmojiDisplay::SetupGifContainer() {
+void OttoEmojiDisplay::SetupImageContainer() {
     DisplayLockGuard lock(this);
 
     if (emoji_label_) {
@@ -86,13 +93,12 @@ void OttoEmojiDisplay::SetupGifContainer() {
     lv_obj_set_style_border_width(emoji_label_, 0, 0);
     lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
 
-    emotion_gif_ = lv_gif_create(content_);
-    int gif_size = LV_HOR_RES;
-    lv_obj_set_size(emotion_gif_, gif_size, gif_size);
-    lv_obj_set_style_border_width(emotion_gif_, 0, 0);
-    lv_obj_set_style_bg_opa(emotion_gif_, LV_OPA_TRANSP, 0);
-    lv_obj_center(emotion_gif_);
-    lv_gif_set_src(emotion_gif_, &staticstate);
+    emotion_image_ = lv_image_create(content_);
+    lv_obj_set_size(emotion_image_, LV_HOR_RES, LV_HOR_RES);
+    lv_obj_set_style_border_width(emotion_image_, 0, 0);
+    lv_obj_set_style_bg_opa(emotion_image_, LV_OPA_TRANSP, 0);
+    lv_obj_center(emotion_image_);
+    lv_image_set_src(emotion_image_, &emotion_neutral);
 
     chat_message_label_ = lv_label_create(content_);
     lv_label_set_text(chat_message_label_, "");
@@ -116,22 +122,58 @@ void OttoEmojiDisplay::SetupGifContainer() {
 }
 
 void OttoEmojiDisplay::SetEmotion(const char* emotion) {
-    if (!emotion || !emotion_gif_) {
+    if (!emotion || !emotion_image_) {
+        return;
+    }
+
+    const lv_image_dsc_t* image = FindImage(emotion);
+    if (image == nullptr) {
+        image = &emotion_neutral;
+        ESP_LOGI(TAG, "未知表情'%s'，使用默认", emotion);
+    }
+
+    DisplayLockGuard lock(this);
+    base_image_ = image;
+    if (!action_active_) {
+        lv_image_set_src(emotion_image_, image);
+    }
+    ESP_LOGI(TAG, "设置表情: %s", emotion);
+}
+
+const lv_image_dsc_t* OttoEmojiDisplay::FindImage(const char* name) {
+    for (const auto& map : image_maps_) {
+        if (map.name && strcmp(map.name, name) == 0) {
+            return map.image;
+        }
+    }
+    return nullptr;
+}
+
+bool OttoEmojiDisplay::ShowAction(const char* action) {
+    if (!action || !emotion_image_) {
+        return false;
+    }
+    const lv_image_dsc_t* image = FindImage(action);
+    if (image == nullptr) {
+        ESP_LOGW(TAG, "动作贴图不存在: %s", action);
+        return false;
+    }
+
+    DisplayLockGuard lock(this);
+    action_active_ = true;
+    lv_image_set_src(emotion_image_, image);
+    ESP_LOGI(TAG, "显示动作贴图: %s", action);
+    return true;
+}
+
+void OttoEmojiDisplay::ClearAction() {
+    if (!emotion_image_) {
         return;
     }
 
     DisplayLockGuard lock(this);
-
-    for (const auto& map : emotion_maps_) {
-        if (map.name && strcmp(map.name, emotion) == 0) {
-            lv_gif_set_src(emotion_gif_, map.gif);
-            ESP_LOGI(TAG, "设置表情: %s", emotion);
-            return;
-        }
-    }
-
-    lv_gif_set_src(emotion_gif_, &staticstate);
-    ESP_LOGI(TAG, "未知表情'%s'，使用默认", emotion);
+    action_active_ = false;
+    lv_image_set_src(emotion_image_, base_image_ != nullptr ? base_image_ : &emotion_neutral);
 }
 
 void OttoEmojiDisplay::SetChatMessage(const char* role, const char* content) {

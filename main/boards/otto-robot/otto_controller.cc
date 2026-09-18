@@ -15,6 +15,7 @@
 #include "board.h"
 #include "config.h"
 #include "mcp_server.h"
+#include "otto_emoji_display.h"
 #include "otto_movements.h"
 #include "sdkconfig.h"
 #include "settings.h"
@@ -65,6 +66,8 @@ private:
     std::atomic<int64_t> action_started_at_ms_{0};
     std::atomic<int64_t> last_action_finished_at_ms_{0};
     std::atomic<int> current_sound_action_type_{0};
+    std::atomic<bool> display_action_active_{false};
+    std::atomic<int> display_action_type_{0};
 
     static const char* ActionName(int action_type) {
         switch (action_type) {
@@ -110,6 +113,34 @@ private:
         if (name == "home") return ACTION_HOME;
         if (name == "laugh") return ACTION_LAUGH;
         return 0;
+    }
+
+    static const char* ActionImageName(int action_type) {
+        switch (action_type) {
+            case ACTION_WALK: return "action_walk";
+            case ACTION_TURN: return "action_turn";
+            case ACTION_JUMP: return "action_jump";
+            case ACTION_SWING: return "action_swing";
+            case ACTION_MOONWALK: return "action_moonwalk";
+            case ACTION_BEND: return "action_bend";
+            case ACTION_SHAKE_LEG: return "action_shake_leg";
+            case ACTION_UPDOWN: return "action_updown";
+            case ACTION_TIPTOE_SWING: return "action_tiptoe_swing";
+            case ACTION_JITTER: return "action_jitter";
+            case ACTION_ASCENDING_TURN: return "action_ascending_turn";
+            case ACTION_CRUSAITO: return "action_crusaito";
+            case ACTION_FLAPPING: return "action_flapping";
+            case ACTION_HANDS_UP: return "action_hands_up";
+            case ACTION_HANDS_DOWN: return "action_hands_down";
+            case ACTION_HAND_WAVE: return "action_hand_wave";
+            case ACTION_HOME: return "action_home";
+            case ACTION_LAUGH: return "action_laugh";
+            default: return nullptr;
+        }
+    }
+
+    static OttoEmojiDisplay* GetOttoDisplay() {
+        return static_cast<OttoEmojiDisplay*>(Board::GetInstance().GetDisplay());
     }
 
     static void SoundTask(void* arg) {
@@ -192,6 +223,11 @@ private:
                 controller->current_action_amount_.store(params.amount);
                 controller->action_started_at_ms_.store(esp_timer_get_time() / 1000);
                 controller->is_action_in_progress_.store(true);
+                if (auto* display = GetOttoDisplay()) {
+                    const bool shown = display->ShowAction(ActionImageName(params.action_type));
+                    controller->display_action_active_.store(shown);
+                    controller->display_action_type_.store(shown ? params.action_type : 0);
+                }
 
                 // Enqueue without waiting for audio decoding so motion starts immediately.
                 // A laugh has no servo movement, so keep its action lifecycle active until
@@ -302,6 +338,11 @@ private:
                 controller->last_action_finished_at_ms_.store(esp_timer_get_time() / 1000);
                 controller->current_action_type_.store(0);
                 controller->is_action_in_progress_.store(false);
+                if (auto* display = GetOttoDisplay()) {
+                    display->ClearAction();
+                }
+                controller->display_action_active_.store(false);
+                controller->display_action_type_.store(0);
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
         }
@@ -309,8 +350,9 @@ private:
 
     void StartActionTaskIfNeeded() {
         if (action_task_handle_ == nullptr) {
-            xTaskCreate(ActionTask, "otto_action", 1024 * 3, this, configMAX_PRIORITIES - 1,
-                        &action_task_handle_);
+            // Audio input/output must preempt servo interpolation so speech and
+            // local action sounds do not stutter while a movement is running.
+            xTaskCreate(ActionTask, "otto_action", 1024 * 3, this, 3, &action_task_handle_);
         }
     }
 
@@ -346,6 +388,11 @@ private:
     }
 
 public:
+    bool IsIdleForConversation() const {
+        return !is_action_in_progress_.load() && !sound_busy_.load() &&
+               (action_queue_ == nullptr || uxQueueMessagesWaiting(action_queue_) == 0);
+    }
+
     bool QueueActionByName(const std::string& action_name, int steps, int speed, int direction,
                            int amount, std::string& error) {
         const int action_type = ActionTypeFromName(action_name);
@@ -384,6 +431,11 @@ public:
         }
         is_action_in_progress_.store(false);
         current_action_type_.store(0);
+        if (auto* display = GetOttoDisplay()) {
+            display->ClearAction();
+        }
+        display_action_active_.store(false);
+        display_action_type_.store(0);
         if (action_queue_ != nullptr) {
             xQueueReset(action_queue_);
         }
@@ -473,6 +525,20 @@ public:
         cJSON_AddStringToObject(sound, "action_sound",
                                 ActionName(current_sound_action_type_.load()));
         cJSON_AddItemToObject(root, "sound", sound);
+
+        cJSON* display = cJSON_CreateObject();
+        const bool display_action_active = display_action_active_.load();
+        const int display_action_type = display_action_type_.load();
+        cJSON_AddBoolToObject(display, "action_image_active", display_action_active);
+        cJSON_AddStringToObject(
+            display, "image_alias",
+            display_action_active ? ActionImageName(display_action_type) : "base_emotion");
+        cJSON_AddItemToObject(root, "display", display);
+
+        cJSON* audio = cJSON_CreateObject();
+        cJSON_AddNumberToObject(
+            audio, "output_volume", Board::GetInstance().GetAudioCodec()->output_volume());
+        cJSON_AddItemToObject(root, "audio", audio);
 
         char* text = cJSON_PrintUnformatted(root);
         std::string result = text == nullptr ? "{}" : text;
@@ -823,6 +889,13 @@ bool StopOttoAction(std::string& error) {
     }
     g_otto_controller->StopAction();
     return true;
+}
+
+bool IsOttoIdleForConversation() {
+    if (g_otto_controller == nullptr) {
+        return false;
+    }
+    return g_otto_controller->IsIdleForConversation();
 }
 
 std::string GetOttoAvailableActionsJson() {

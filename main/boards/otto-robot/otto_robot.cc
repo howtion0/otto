@@ -16,6 +16,7 @@
 #include "mcp_server.h"
 #include "otto_emoji_display.h"
 #include "power_manager.h"
+#include "settings.h"
 #include "system_reset.h"
 #include "wifi_board.h"
 
@@ -94,12 +95,25 @@ private:
         ::InitializeOttoController();
     }
 
+    void InitializeAudioProfile() {
+        // Apply the louder Otto profile once. Later user volume changes remain
+        // persistent instead of being overwritten on every reboot.
+        Settings settings("otto_profile", true);
+        constexpr int kAudioProfileVersion = 2;
+        if (settings.GetInt("audio_profile", 0) < kAudioProfileVersion) {
+            GetAudioCodec()->SetOutputVolume(100);
+            settings.SetInt("audio_profile", kAudioProfileVersion);
+            ESP_LOGI(TAG, "Otto输出音量已升级到100");
+        }
+    }
+
 public:
     OttoRobot() : boot_button_(BOOT_BUTTON_GPIO) {
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeButtons();
         InitializePowerManager();
+        InitializeAudioProfile();
         InitializeOttoController();
         GetBacklight()->RestoreBrightness();
     }

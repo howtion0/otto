@@ -456,6 +456,48 @@ void Application::ToggleConversationMode() {
     }
 }
 
+bool Application::ValidateConversationStart(std::string& error, bool& should_transition) {
+    should_transition = false;
+    if (!protocol_) {
+        error = "protocol is not initialized";
+        return false;
+    }
+    const DeviceState state = device_state_;
+    if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
+        state == kDeviceStateSpeaking) {
+        return true;
+    }
+    if (state != kDeviceStateIdle) {
+        error = std::string("conversation cannot start from state ") + DeviceStateName(state);
+        return false;
+    }
+    if (!IsOttoIdleForConversation()) {
+        error = "robot action or local sound is busy";
+        return false;
+    }
+    should_transition = true;
+    return true;
+}
+
+bool Application::ValidateConversationStop(std::string& error, bool& should_transition) {
+    should_transition = false;
+    if (!protocol_) {
+        error = "protocol is not initialized";
+        return false;
+    }
+    const DeviceState state = device_state_;
+    if (state == kDeviceStateIdle) {
+        return true;
+    }
+    if (state != kDeviceStateConnecting && state != kDeviceStateListening &&
+        state != kDeviceStateSpeaking) {
+        error = std::string("conversation cannot stop from state ") + DeviceStateName(state);
+        return false;
+    }
+    should_transition = true;
+    return true;
+}
+
 void Application::StartListening() {
     if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -679,6 +721,63 @@ void Application::Start() {
             if (cJSON_IsObject(payload)) {
                 McpServer::GetInstance().ParseMessage(payload);
             }
+        } else if (strcmp(type->valuestring, "otto_conversation") == 0) {
+            std::string command_id;
+            if (!ReadCommandId(root, command_id)) {
+                ESP_LOGW(TAG, "Rejected conversation control without a bounded string id");
+                return;
+            }
+            std::string cached_response;
+            if (FindCachedCommandResponse(command_id, cached_response)) {
+                ESP_LOGI(TAG, "Replaying cached conversation response for id=%s",
+                         command_id.c_str());
+                SendJsonMessage(cached_response);
+                return;
+            }
+            const cJSON* command = cJSON_GetObjectItem(root, "command");
+            if (!cJSON_IsString(command) || command->valuestring == nullptr ||
+                (strcmp(command->valuestring, "start") != 0 &&
+                 strcmp(command->valuestring, "stop") != 0)) {
+                ESP_LOGW(TAG, "Rejected invalid conversation command");
+                return;
+            }
+
+            cJSON* reply = cJSON_CreateObject();
+            CopyJsonId(reply, cJSON_GetObjectItem(root, "id"));
+            cJSON_AddStringToObject(reply, "type", "otto_conversation_ack");
+            cJSON_AddStringToObject(reply, "source", "mqtt");
+            cJSON_AddStringToObject(reply, "command", command->valuestring);
+            std::string error;
+            const bool start_requested = strcmp(command->valuestring, "start") == 0;
+            bool should_transition = false;
+            const bool accepted = start_requested
+                                      ? ValidateConversationStart(error, should_transition)
+                                      : ValidateConversationStop(error, should_transition);
+            cJSON_AddBoolToObject(reply, "ok", accepted);
+            if (!accepted) {
+                cJSON_AddStringToObject(reply, "error", error.c_str());
+            }
+            cJSON* runtime = cJSON_CreateObject();
+            AddOttoRuntime(runtime);
+            cJSON_AddItemToObject(reply, "runtime", runtime);
+            std::string response = PrintJson(reply);
+            CacheCommandResponse(command_id, response);
+            // Publish the correlated ACK before queuing an audio-channel
+            // transition. OpenAudioChannel may block for several seconds while
+            // MQTT negotiates UDP; the control plane must not false-timeout on
+            // an operation the device has already accepted.
+            Schedule([this, response, accepted, should_transition, start_requested]() {
+                if (protocol_ == nullptr) {
+                    return;
+                }
+                protocol_->SendJson(response);
+                if (!accepted || !should_transition) {
+                    return;
+                }
+                RecordVoiceEvent(start_requested ? "remote_start_requested"
+                                                 : "remote_stop_requested");
+                ToggleConversationMode();
+            });
         } else if (strcmp(type->valuestring, "otto_action") == 0 ||
                    strcmp(type->valuestring, "action") == 0) {
             // Optional direct MQTT control format. MCP tools remain supported

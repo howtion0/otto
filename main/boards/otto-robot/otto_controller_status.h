@@ -8,6 +8,7 @@
 bool QueueOttoAction(const std::string& action_name, int steps, int speed, int direction,
                      int amount, std::string& error);
 bool StopOttoAction(std::string& error);
+bool IsOttoIdleForConversation();
 std::string GetOttoAvailableActionsJson();
 
 // Returns a compact JSON snapshot of the current and last Otto action.

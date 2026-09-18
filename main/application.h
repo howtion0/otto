@@ -54,6 +54,8 @@ public:
     void AbortSpeaking(AbortReason reason);
     void ToggleChatState();
     void ToggleConversationMode();
+    bool ValidateConversationStart(std::string& error, bool& should_transition);
+    bool ValidateConversationStop(std::string& error, bool& should_transition);
     void StartListening();
     void StopListening();
     void Reboot();

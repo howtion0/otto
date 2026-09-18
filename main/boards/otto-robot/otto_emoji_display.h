@@ -1,13 +1,11 @@
 #pragma once
 
-#include <libs/gif/lv_gif.h>
-
 #include "display/lcd_display.h"
-#include "otto_emoji_gif.h"
+#include "kanshan_emotions.h"
 
 /**
- * @brief Otto机器人GIF表情显示类
- * 继承LcdDisplay，添加GIF表情支持
+ * @brief Otto机器人看山表情显示类
+ * 继承LcdDisplay，仅替换中央表情，保留状态栏和聊天文字。
  */
 class OttoEmojiDisplay : public SpiLcdDisplay {
 public:
@@ -26,16 +24,23 @@ public:
     // 重写聊天消息设置方法
     virtual void SetChatMessage(const char* role, const char* content) override;
 
+    // 动作期间临时覆盖中央表情；结束后恢复最近一次对话表情。
+    bool ShowAction(const char* action);
+    void ClearAction();
+
 private:
-    void SetupGifContainer();
+    void SetupImageContainer();
+    static const lv_image_dsc_t* FindImage(const char* name);
 
-    lv_obj_t* emotion_gif_;  ///< GIF表情组件
+    lv_obj_t* emotion_image_;  ///< 中央看山表情组件
+    const lv_image_dsc_t* base_image_;  ///< 动作结束后恢复的对话表情
+    bool action_active_;
 
-    // 表情映射
-    struct EmotionMap {
+    // 对话表情和动作贴图映射
+    struct ImageMap {
         const char* name;
-        const lv_img_dsc_t* gif;
+        const lv_image_dsc_t* image;
     };
 
-    static const EmotionMap emotion_maps_[];
+    static const ImageMap image_maps_[];
 };
