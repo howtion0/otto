@@ -34,7 +34,7 @@ macOS 示例：`idf.py -p /dev/cu.YOUR_PORT flash monitor`。退出串口监视�
 
 ## 本地 Otto Master 连接验证
 
-Otto 固件的设备名为 `EVA1`。Wi-Fi 通过 DHCP 成功后，固件会查询电脑的 `master.local`，然后连接 TCP `8765`，发送换行分隔的 JSON。该链路独立于小智的 MQTT/语音协议，只用于验证配网、mDNS、TCP 和双向消息。
+Otto 固件的设备名为 `EVA1`。Wi-Fi 通过 DHCP 成功后，固件会查询电脑的 `master.local`，然后连接 TCP `8765`，发送换行分隔的 JSON。该链路独立于MQTT/语音会话，只用于验证配网、mDNS、TCP 和双向消息；其中显式mDNS解析器由两条链共享。
 
 macOS 上启动轻量 WebUI：
 
@@ -51,6 +51,8 @@ python3 scripts/otto_master.py --advertise-ip 192.168.1.20
 WebUI 可查看设备的 `hello`、`heartbeat` 和 IP，也可以发送 `ping`、`status`、`echo` 或任意 JSON。设备默认每 5 秒发送一次心跳；同一集群中即使多个设备都显示为 `EVA1`，服务端仍使用 Wi-Fi MAC 作为唯一设备 ID。
 
 ## MQTT / WebSocket Profile
+
+固件`2.0.16+`遇到明文局域网端点`mqtt://master.local:1883`时，不再把`.local`名称直接交给路由器DNS或ESP MQTT内部缓存。首次连接及每次重连都先显式发送mDNS查询，只把当次解析出的IPv4交给MQTT Client；数值IP不会写入NVS。连接后fleet hello与后续heartbeat继续上报MAC、设备名和当前DHCP IP，Server按MAC更新动态设备表。因此更换路由、网段或承载Otto Master的主机不需要修改固件IP；新Server必须接管`master.local`，并迁移原MQTT设备凭据或走受认证的重新配对流程。
 
 固件 `2.0.7+` 可在保留Wi-Fi和MQTT回滚资料的前提下，通过认证的 `otto_provision` 写入WebSocket Profile及 `preferred_transport`。允许值仅为 `mqtt` 或 `websocket`；已锁定设备必须提交当前设备token，MAC、client ID、Topic和WebSocket token必须互相匹配。切换后需要重启。
 
@@ -77,7 +79,7 @@ Otto Master `test0.9`已经实现DeepSeek流式`tool_calls`、设备动作目录
 
 2.0.12 还把 Otto 输出音量一次性提升到 90。2.0.13 根据真机听感把新的持久音量档位升级为 100；迁移只执行一次，用户以后主动调节的音量不会在每次重启时被覆盖。舵机动作任务优先级低于音频输入/输出任务，减少动作期间本地音效或对话音频卡顿。
 
-2.0.14 把动作图切换绑定到实际动作任务的开始/结束，而不是只依赖对话或服务端文字事件；状态查询同时返回`display.action_image_active`、`display.image_alias`、`sound.busy`和`audio.output_volume`。2.0.15 增加正式MQTT `otto_conversation start|stop`能力，并在执行可能阻塞的音频通道切换前先发送和缓存关联ACK，避免设备已开始会话但Server等待超时。重复command ID只重放同一ACK，不重复切换。
+2.0.14 把动作图切换绑定到实际动作任务的开始/结束，而不是只依赖对话或服务端文字事件；状态查询同时返回`display.action_image_active`、`display.image_alias`、`sound.busy`和`audio.output_volume`。2.0.15 增加正式MQTT `otto_conversation start|stop`能力，并在执行可能阻塞的音频通道切换前先发送和缓存关联ACK，避免设备已开始会话但Server等待超时。重复command ID只重放同一ACK，不重复切换。2.0.16让正式MQTT重连复用显式mDNS解析，避免同名Wi-Fi换网或更换Server主机后依赖路由器DNS缓存。
 
 ## 文件范围
 

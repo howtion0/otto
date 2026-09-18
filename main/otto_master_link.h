@@ -11,6 +11,11 @@
 
 class Tcp;
 
+// Resolve the current Otto Master address without persisting the DHCP address.
+// Both the validation link and the production MQTT transport use this query so
+// a reconnect can follow master.local to another network or Server host.
+bool ResolveOttoMasterMdns(std::string& address);
+
 // A deliberately small, non-audio connection used to validate:
 // Wi-Fi DHCP -> mDNS(master.local) -> TCP -> bidirectional JSON messages.
 class OttoMasterLink {
@@ -27,7 +32,6 @@ private:
     OttoMasterLink& operator=(const OttoMasterLink&) = delete;
 
     void Run();
-    bool ResolveMasterMdns(std::string& address);
     void HandleStream(const std::string& data);
     void HandleMessage(const std::string& message);
     void SendHello();

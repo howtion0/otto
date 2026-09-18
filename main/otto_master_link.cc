@@ -372,7 +372,7 @@ bool OttoMasterLink::SendJson(const std::string& json) {
     return true;
 }
 
-bool OttoMasterLink::ResolveMasterMdns(std::string& address) {
+bool ResolveOttoMasterMdns(std::string& address) {
     address.clear();
 
     int socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -760,7 +760,7 @@ void OttoMasterLink::HandleMessage(const std::string& message) {
 void OttoMasterLink::Run() {
     while (running_.load()) {
         std::string master_address;
-        if (!ResolveMasterMdns(master_address)) {
+        if (!ResolveOttoMasterMdns(master_address)) {
             ESP_LOGW(TAG, "Cannot resolve %s, retry in %u ms", kMasterHostname,
                      kReconnectDelayMs);
             vTaskDelay(pdMS_TO_TICKS(kReconnectDelayMs));

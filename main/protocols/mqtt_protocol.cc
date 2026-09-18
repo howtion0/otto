@@ -2,12 +2,14 @@
 #include "board.h"
 #include "application.h"
 #include "boards/otto-robot/otto_controller_status.h"
+#include "otto_master_link.h"
 #include "settings.h"
 #include "system_info.h"
 
 #include <esp_app_desc.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <arpa/inet.h>
@@ -89,6 +91,22 @@ bool ParseMqttEndpoint(const std::string& endpoint, std::string& host, int& port
         port = static_cast<int>(parsed);
     }
     return true;
+}
+
+bool IsOttoMasterMdnsEndpoint(const std::string& endpoint, std::string host) {
+    if (endpoint.rfind("mqtt://", 0) != 0) {
+        // Do not replace the hostname of a TLS endpoint: certificate/SNI
+        // validation may require the original DNS name.
+        return false;
+    }
+    while (!host.empty() && host.back() == '.') {
+        host.pop_back();
+    }
+    for (char& character : host) {
+        character = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character)));
+    }
+    return host == "master.local";
 }
 
 std::string BuildFleetPresence(const char* type) {
@@ -280,8 +298,18 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         ScheduleReconnect();
         return false;
     }
-    ESP_LOGI(TAG, "Connecting to MQTT host %s:%d", broker_address.c_str(), broker_port);
-    if (!mqtt_->Connect(broker_address, broker_port, client_id, username, password)) {
+    std::string connection_address = broker_address;
+    if (IsOttoMasterMdnsEndpoint(endpoint, broker_address)) {
+        if (!ResolveOttoMasterMdns(connection_address)) {
+            ESP_LOGW(TAG, "Cannot resolve MQTT host %s through mDNS", broker_address.c_str());
+            SetError(Lang::Strings::SERVER_NOT_FOUND);
+            ScheduleReconnect();
+            return false;
+        }
+    }
+    ESP_LOGI(TAG, "Connecting to MQTT host %s (%s):%d", broker_address.c_str(),
+             connection_address.c_str(), broker_port);
+    if (!mqtt_->Connect(connection_address, broker_port, client_id, username, password)) {
         ESP_LOGE(TAG, "Failed to connect to endpoint");
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
         ScheduleReconnect();
